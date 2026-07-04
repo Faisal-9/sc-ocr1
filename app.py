@@ -1,25 +1,11 @@
-"""Hard Scan OCR Extractor with layout-preserving export.
+from __future__ import annotations
 
-Features:
-- PyMuPDF rendering (no Poppler)
-- All pages or fixed page range
-- Page numbering using original page numbers
-- Conservative OCR by default (exact text preserved)
-- Table extraction
-- Layout-preserving HTML export
-- Figure/image block extraction
-- OCR overlay placement for scanned pages using PaddleOCR boxes
-
-Run:
-    streamlit run app.py
-"""
-
-import base64
 import os
 import re
-from io import StringIO
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import cv2
 import fitz
@@ -28,22 +14,36 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from config import (
+    DEFAULT_LANG,
+    ENABLE_RUSSIAN_CORRECTION,
+    SHOW_DEBUG_PANEL,
+    SHOW_GPU_STATUS,
+    SHOW_PAGE_PROGRESS,
+    SHOW_PROCESSING_TIMER,
+    SHOW_ETA,
+)
 from preprocessing import crop_document, deskew, enhance_document, upscale_document
 from ocr.ensemble import ocr_ensemble
-from ocr.paddle_engine import load_paddle_engine
 from language import correct_text
 from export import export_to_docx, export_to_pdf
+from export.layout_html_export import export_layout_html
+from layout.page_layout import (
+    extract_page_layout,
+    extract_layout_from_image,
+    extract_tables_from_page,
+    extract_tables_from_image,
+    render_page_bgr,
+)
 from utils.confidence import format_review_report, is_low_confidence
+from utils.gpu import gpu_available, gpu_name, gpu_memory_total_gb, gpu_memory_allocated_gb
+from utils.device_status import get_actual_device
 
 try:
     from paddleocr import PPStructure
 except Exception:
     PPStructure = None
 
-
-# ----------------------------
-# General helpers
-# ----------------------------
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -65,11 +65,12 @@ def normalize_text(text: str) -> str:
     return "\n".join(out).strip()
 
 
-def safe_remove(path: str) -> None:
-    try:
-        os.remove(path)
-    except Exception:
-        pass
+def format_hms(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}h : {minutes:02d}m : {secs:02d}s"
 
 
 def image_bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
@@ -85,35 +86,6 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
         return Image.fromarray(image_bgr)
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
-
-
-def image_to_b64(image_bgr: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".png", image_bgr)
-    if not ok:
-        return ""
-    return base64.b64encode(buf.tobytes()).decode("utf-8")
-
-
-def bbox_to_px(bbox: Tuple[float, float, float, float], zoom: float) -> Tuple[int, int, int, int]:
-    x0, y0, x1, y1 = bbox
-    return (
-        int(round(x0 * zoom)),
-        int(round(y0 * zoom)),
-        int(round(x1 * zoom)),
-        int(round(y1 * zoom)),
-    )
-
-
-def crop_bgr(image_bgr: np.ndarray, bbox_px: Tuple[int, int, int, int]) -> np.ndarray:
-    x0, y0, x1, y1 = bbox_px
-    h, w = image_bgr.shape[:2]
-    x0 = max(0, min(w, x0))
-    y0 = max(0, min(h, y0))
-    x1 = max(0, min(w, x1))
-    y1 = max(0, min(h, y1))
-    if x1 <= x0 or y1 <= y0:
-        return image_bgr
-    return image_bgr[y0:y1, x0:x1].copy()
 
 
 def dataframe_to_markdown(df: pd.DataFrame) -> str:
@@ -134,517 +106,12 @@ def dataframe_to_markdown(df: pd.DataFrame) -> str:
     return "\n".join([header_line, sep_line] + data_lines)
 
 
-# ----------------------------
-# Layout extraction helpers
-# ----------------------------
-
-@st.cache_resource(show_spinner=False)
-def get_table_engine():
-    if PPStructure is None:
-        return None
-    try:
-        return PPStructure(show_log=False)
-    except Exception:
-        return None
-
-
-def text_from_native_block(block: Dict[str, Any]) -> str:
-    lines = []
-    for line in block.get("lines", []):
-        spans = line.get("spans", [])
-        line_text = "".join(span.get("text", "") for span in spans).strip()
-        if line_text:
-            lines.append(line_text)
-    return "\n".join(lines).strip()
-
-
-def extract_native_text_blocks(page: fitz.Page, zoom: float) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    try:
-        data = page.get_text("dict")
-    except Exception:
-        return items
-
-    for block in data.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        text = text_from_native_block(block)
-        bbox = block.get("bbox")
-        if not text or not bbox:
-            continue
-        items.append(
-            {
-                "kind": "text",
-                "bbox_px": bbox_to_px(tuple(bbox), zoom),
-                "text": text,
-                "conf": 1.0,
-                "source": "native",
-            }
-        )
-    return items
-
-
-def extract_image_blocks_from_native(page: fitz.Page, page_bgr: np.ndarray, zoom: float) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    try:
-        data = page.get_text("dict")
-    except Exception:
-        return items
-
-    for block in data.get("blocks", []):
-        if block.get("type") != 1:
-            continue
-        bbox = block.get("bbox")
-        if not bbox:
-            continue
-        bbox_px = bbox_to_px(tuple(bbox), zoom)
-        crop = crop_bgr(page_bgr, bbox_px)
-        items.append(
-            {
-                "kind": "image",
-                "bbox_px": bbox_px,
-                "image_b64": image_to_b64(crop),
-            }
-        )
-    return items
-
-
-def extract_tables_from_page(page: fitz.Page, page_bgr: np.ndarray, zoom: float) -> List[Dict[str, Any]]:
-    tables: List[Dict[str, Any]] = []
-    if not hasattr(page, "find_tables"):
-        return tables
-
-    try:
-        finder = page.find_tables()
-    except Exception:
-        return tables
-
-    found = getattr(finder, "tables", finder)
-    if not found:
-        return tables
-
-    for idx, table in enumerate(found, start=1):
-        try:
-            bbox = getattr(table, "bbox", None)
-            if bbox is None and isinstance(table, dict):
-                bbox = table.get("bbox")
-            if bbox is None:
-                continue
-
-            bbox_px = bbox_to_px(tuple(bbox), zoom)
-            crop = crop_bgr(page_bgr, bbox_px)
-            rows = []
-            if hasattr(table, "extract"):
-                try:
-                    rows = table.extract()
-                except Exception:
-                    rows = []
-
-            tables.append(
-                {
-                    "kind": "table",
-                    "table_index": idx,
-                    "bbox_px": bbox_px,
-                    "image_b64": image_to_b64(crop),
-                    "rows": rows,
-                }
-            )
-        except Exception:
-            continue
-    return tables
-
-
-def extract_text_boxes_with_paddle(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
-    engine = load_paddle_engine()
-    if engine is None:
-        return []
-
-    try:
-        result = engine.ocr(image_bgr, cls=True)
-    except Exception:
-        return []
-
-    items: List[Dict[str, Any]] = []
-    if not result:
-        return items
-
-    for page_result in result:
-        if not page_result:
-            continue
-        for det in page_result:
-            try:
-                box = det[0]
-                text = det[1][0]
-                conf = float(det[1][1])
-                xs = [p[0] for p in box]
-                ys = [p[1] for p in box]
-                bbox_px = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-                items.append(
-                    {
-                        "kind": "text",
-                        "bbox_px": bbox_px,
-                        "text": text,
-                        "conf": conf,
-                        "source": "paddleocr",
-                    }
-                )
-            except Exception:
-                continue
-    return items
-
-
-def render_page_bgr(page: fitz.Page, zoom: float = 5.0) -> np.ndarray:
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    arr = np.frombuffer(pix.samples, dtype=np.uint8)
-    if pix.n == 4:
-        img = arr.reshape(pix.height, pix.width, 4)
-        return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-    if pix.n == 3:
-        img = arr.reshape(pix.height, pix.width, 3)
-        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    img = arr.reshape(pix.height, pix.width)
-    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-
-def crop_and_prepare_for_table(image_bgr: np.ndarray) -> np.ndarray:
-    img = crop_document(image_bgr)
-    img = deskew(img)
-    img = upscale_document(img, factor=2)
-    return img
-
-
-def extract_tables_from_image(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
-    engine = get_table_engine()
-    if engine is None:
-        return []
-    try:
-        table_img = crop_and_prepare_for_table(image_bgr)
-        result = engine(table_img)
-    except Exception:
-        return []
-
-    tables: List[Dict[str, Any]] = []
-    if not result:
-        return tables
-
-    for idx, item in enumerate(result, start=1):
-        try:
-            if not isinstance(item, dict) or item.get("type") != "table":
-                continue
-            bbox = item.get("bbox")
-            res = item.get("res")
-            html = ""
-            if isinstance(res, dict):
-                html = res.get("html", "") or ""
-            elif isinstance(res, str):
-                html = res
-
-            df = None
-            if html:
-                try:
-                    parsed = pd.read_html(StringIO(html))
-                    if parsed:
-                        df = parsed[0]
-                except Exception:
-                    df = None
-
-            tables.append(
-                {
-                    "table_index": idx,
-                    "bbox": bbox,
-                    "html": html,
-                    "df": df,
-                    "markdown": dataframe_to_markdown(df) if df is not None else "",
-                }
-            )
-        except Exception:
-            continue
-    return tables
-
-
-def extract_page_layout(page: fitz.Page, zoom: float = 5.0) -> Dict[str, Any]:
-    page_bgr = render_page_bgr(page, zoom=zoom)
-    width_px, height_px = page_bgr.shape[1], page_bgr.shape[0]
-
-    native_text = extract_native_text_blocks(page, zoom=zoom)
-    images = extract_image_blocks_from_native(page, page_bgr, zoom=zoom)
-    tables = extract_tables_from_page(page, page_bgr, zoom=zoom)
-
-    text_items = native_text if native_text else extract_text_boxes_with_paddle(page_bgr)
-    elements = text_items + images + tables
-    elements.sort(key=lambda item: (item["bbox_px"][1], item["bbox_px"][0]))
-
-    return {
-        "page_width_px": width_px,
-        "page_height_px": height_px,
-        "page_b64": image_to_b64(page_bgr),
-        "elements": elements,
-        "text_items": text_items,
-        "image_items": images,
-        "table_items": tables,
-    }
-
-
-def extract_layout_from_image(image_bgr: np.ndarray) -> Dict[str, Any]:
-    height_px, width_px = image_bgr.shape[:2]
-    text_items = extract_text_boxes_with_paddle(image_bgr)
-    return {
-        "page_width_px": width_px,
-        "page_height_px": height_px,
-        "page_b64": image_to_b64(image_bgr),
-        "elements": text_items,
-        "text_items": text_items,
-        "image_items": [],
-        "table_items": [],
-    }
-
-
-def table_rows_to_html(rows: List[List[Any]]) -> str:
-    if not rows:
-        return ""
-    parts = ["<table class='table-box'>"]
-    for r, row in enumerate(rows):
-        parts.append("<tr>")
-        for cell in row:
-            tag = "th" if r == 0 else "td"
-            cell_text = "" if cell is None else str(cell)
-            parts.append(f"<{tag}>{cell_text}</{tag}>")
-        parts.append("</tr>")
-    parts.append("</table>")
-    return "".join(parts)
-
-
-def export_layout_html(pages: List[Dict[str, Any]], title: str = "OCR Layout Report") -> bytes:
-    css = """
-    <style>
-      body { font-family: Arial, sans-serif; margin: 0; background: #f4f4f4; }
-      .wrap { padding: 20px; }
-      .page {
-        position: relative;
-        margin: 0 auto 28px auto;
-        background-repeat: no-repeat;
-        background-size: contain;
-        background-position: top left;
-        box-shadow: 0 2px 16px rgba(0,0,0,.12);
-        border: 1px solid #ddd;
-        background-color: white;
-      }
-      .overlay-text {
-        position: absolute;
-        color: rgba(0,0,0,0.01);
-        white-space: pre-wrap;
-        line-height: 1.15;
-        user-select: text;
-      }
-      .section-title {
-        margin: 12px 0 8px;
-        font-size: 14px;
-        font-weight: 700;
-      }
-      .asset-row { display: flex; gap: 12px; flex-wrap: wrap; }
-      .asset-card {
-        background: white;
-        border: 1px solid #ddd;
-        padding: 10px;
-        margin-bottom: 10px;
-      }
-      .asset-img { max-width: 100%; display: block; }
-      .table-box { border-collapse: collapse; width: 100%; margin-top: 8px; background: white; }
-      .table-box td, .table-box th { border: 1px solid #777; padding: 4px 6px; font-size: 12px; vertical-align: top; }
-      .meta { font-size: 12px; color: #666; margin-bottom: 6px; }
-    </style>
-    """
-
-    parts = [
-        "<!doctype html>",
-        "<html><head><meta charset='utf-8'>",
-        f"<title>{title}</title>",
-        css,
-        "</head><body><div class='wrap'>",
-        f"<h1>{title}</h1>",
-    ]
-
-    for i, page in enumerate(pages, start=1):
-        w = int(page["page_width_px"])
-        h = int(page["page_height_px"])
-        page_b64 = page["page_b64"]
-        parts.append(
-            f"<div class='page' style='width:{w}px;height:{h}px;background-image:url(data:image/png;base64,{page_b64});'>"
-        )
-
-        for item in page.get("elements", []):
-            if item.get("kind") != "text":
-                continue
-            x0, y0, x1, y1 = item["bbox_px"]
-            left = max(0, x0)
-            top = max(0, y0)
-            width = max(1, x1 - x0)
-            height = max(1, y1 - y0)
-            txt = str(item.get("text", ""))
-            parts.append(
-                f"<div class='overlay-text' style='left:{left}px;top:{top}px;width:{width}px;height:{height}px;'>"
-                f"{txt}</div>"
-            )
-
-        parts.append("</div>")
-
-        images = page.get("image_items", [])
-        tables = page.get("table_items", [])
-        if images or tables:
-            parts.append(f"<div class='section-title'>Page {i} extracted assets</div>")
-
-        if images:
-            parts.append("<div class='asset-row'>")
-            for img in images:
-                img_b64 = img.get("image_b64", "")
-                if not img_b64:
-                    continue
-                parts.append(
-                    "<div class='asset-card'>"
-                    "<div class='meta'>Extracted image / figure</div>"
-                    f"<img class='asset-img' src='data:image/png;base64,{img_b64}' />"
-                    "</div>"
-                )
-            parts.append("</div>")
-
-        if tables:
-            for t in tables:
-                rows = t.get("rows", [])
-                parts.append("<div class='asset-card'>")
-                parts.append(f"<div class='meta'>Table {t.get('table_index', '')}</div>")
-                if rows:
-                    parts.append(table_rows_to_html(rows))
-                img_b64 = t.get("image_b64", "")
-                if img_b64:
-                    parts.append("<div class='meta' style='margin-top:8px;'>Detected table region</div>")
-                    parts.append(f"<img class='asset-img' src='data:image/png;base64,{img_b64}' />")
-                parts.append("</div>")
-
-    parts.append("</div></body></html>")
-    return "\n".join(parts).encode("utf-8")
-
-
-# ----------------------------
-# OCR processing
-# ----------------------------
-
-def preprocess_image(image_bgr: np.ndarray) -> np.ndarray:
-    if image_bgr is None:
-        raise ValueError("Empty image.")
-
-    img = crop_document(image_bgr)
-    img = deskew(img)
-    img = upscale_document(img, factor=4)
-    enhanced = enhance_document(img)
-    if len(enhanced.shape) == 2:
-        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-    return enhanced
-
-
-def process_image_page(
-    image_bytes: bytes,
-    file_name: str,
-    page_number: int,
-    lang: str,
-    extract_tables: bool,
-) -> Dict[str, Any]:
-    original = image_bytes_to_bgr(image_bytes)
-    processed = preprocess_image(original)
-    ocr_result = ocr_ensemble(processed, lang=lang)
-
-    raw_text = str(ocr_result.get("text", ""))
-    score = float(ocr_result.get("score", 0.0))
-    engine = str(ocr_result.get("engine", "None"))
-    tables = extract_tables_from_image(original) if extract_tables else []
-    layout = extract_layout_from_image(original)
-
-    return {
-        "file_name": file_name,
-        "page_number": page_number,
-        "engine": engine,
-        "score": score,
-        "raw_text": raw_text,
-        "processed_image": processed,
-        "tables": tables,
-        "layout": layout,
-        "report": format_review_report(raw_text, score, engine),
-    }
-
-
-def process_pdf_file(
-    pdf_bytes: bytes,
-    file_name: str,
-    lang: str,
-    extract_tables: bool,
-    page_mode: str,
-    start_page: int,
-    end_page: int,
-    prefer_text_layer: bool,
-    zoom: float = 5.0,
-) -> List[Dict[str, Any]]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    results: List[Dict[str, Any]] = []
-
-    try:
-        total_pages = len(doc)
-        if page_mode == "Page range":
-            first_page = max(1, start_page)
-            last_page = min(end_page, total_pages)
-            if first_page > last_page:
-                first_page, last_page = last_page, first_page
-        else:
-            first_page = 1
-            last_page = total_pages
-
-        for page_number in range(first_page, last_page + 1):
-            page = doc.load_page(page_number - 1)
-            page_bgr = render_page_bgr(page, zoom=zoom)
-            processed = preprocess_image(page_bgr)
-            layout = extract_page_layout(page, zoom=zoom)
-
-            page_text = ""
-            if prefer_text_layer:
-                try:
-                    page_text = (page.get_text("text") or "").strip()
-                except Exception:
-                    page_text = ""
-
-            if page_text:
-                raw_text = page_text
-                score = 1.0
-                engine = "PDF text layer"
-            else:
-                ocr_result = ocr_ensemble(processed, lang=lang)
-                raw_text = str(ocr_result.get("text", ""))
-                score = float(ocr_result.get("score", 0.0))
-                engine = str(ocr_result.get("engine", "None"))
-                # Keep the OCR box layout for scanned pages.
-                layout["text_items"] = extract_text_boxes_with_paddle(page_bgr)
-                layout["elements"] = layout["text_items"] + layout.get("image_items", []) + layout.get("table_items", [])
-                layout["elements"].sort(key=lambda item: (item["bbox_px"][1], item["bbox_px"][0]))
-
-            if not extract_tables:
-                layout["table_items"] = []
-
-            tables = extract_tables_from_page(page, page_bgr, zoom=zoom) if extract_tables else []
-
-            results.append(
-                {
-                    "file_name": file_name,
-                    "page_number": page_number,
-                    "engine": engine,
-                    "score": score,
-                    "raw_text": raw_text,
-                    "processed_image": processed,
-                    "tables": tables,
-                    "layout": layout,
-                    "report": format_review_report(raw_text, score, engine),
-                }
-            )
-    finally:
-        doc.close()
-
-    return results
+def maybe_correct_text(text: str, apply_correction: bool) -> str:
+    text = normalize_text(text)
+    if apply_correction and ENABLE_RUSSIAN_CORRECTION:
+        text = correct_text(text)
+        text = normalize_text(text)
+    return text.strip()
 
 
 def build_page_block(
@@ -680,21 +147,229 @@ def build_page_block(
     return "\n".join(parts).strip()
 
 
-def maybe_correct_text(text: str, apply_correction: bool) -> str:
-    text = normalize_text(text)
-    if apply_correction:
-        text = correct_text(text)
-        text = normalize_text(text)
-    return text.strip()
+def process_image_page(
+    image_bytes: bytes,
+    file_name: str,
+    page_number: int,
+    lang: str,
+    extract_tables: bool,
+    task_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    original = image_bytes_to_bgr(image_bytes)
+    processed = preprocess_image(original)
+    ocr_result = ocr_ensemble(processed, lang=lang)
+
+    raw_text = str(ocr_result.get("text", ""))
+    score = float(ocr_result.get("score", 0.0))
+    engine = str(ocr_result.get("engine", "None"))
+    layout = extract_layout_from_image(original)
+
+    tables = []
+    if extract_tables:
+        tables = extract_tables_from_image(original)
+
+    if task_state is not None:
+        task_state["current_page"] = page_number
+        task_state["page_total"] = 1
+        task_state["status"] = f"Processing image: {file_name}"
+
+    return {
+        "file_name": file_name,
+        "page_number": page_number,
+        "engine": engine,
+        "score": score,
+        "raw_text": raw_text,
+        "processed_image": processed,
+        "tables": tables,
+        "layout": layout,
+        "report": format_review_report(raw_text, score, engine),
+    }
 
 
-# ----------------------------
-# UI
-# ----------------------------
+def process_pdf_file(
+    pdf_bytes: bytes,
+    file_name: str,
+    lang: str,
+    extract_tables: bool,
+    page_mode: str,
+    start_page: int,
+    end_page: int,
+    prefer_text_layer: bool,
+    zoom: float = 5.0,
+    task_state: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    results: List[Dict[str, Any]] = []
+
+    try:
+        total_pages = len(doc)
+        if page_mode == "Page range":
+            first_page = max(1, start_page)
+            last_page = min(end_page, total_pages)
+            if first_page > last_page:
+                first_page, last_page = last_page, first_page
+        else:
+            first_page = 1
+            last_page = total_pages
+
+        for page_number in range(first_page, last_page + 1):
+            if task_state is not None:
+                task_state["current_page"] = page_number
+                task_state["page_total"] = last_page
+                task_state["status"] = f"Processing PDF page {page_number}/{last_page} : {file_name}"
+
+            page = doc.load_page(page_number - 1)
+            page_bgr = render_page_bgr(page, zoom=zoom)
+            processed = preprocess_image(page_bgr)
+            layout = extract_page_layout(page, zoom=zoom)
+
+            page_text = ""
+            if prefer_text_layer:
+                try:
+                    page_text = (page.get_text("text") or "").strip()
+                except Exception:
+                    page_text = ""
+
+            if page_text:
+                raw_text = page_text
+                score = 1.0
+                engine = "PDF text layer"
+            else:
+                ocr_result = ocr_ensemble(processed, lang=lang)
+                raw_text = str(ocr_result.get("text", ""))
+                score = float(ocr_result.get("score", 0.0))
+                engine = str(ocr_result.get("engine", "None"))
+                print(ocr_result)
+
+            tables = []
+            if extract_tables:
+                tables = extract_tables_from_page(page, page_bgr, zoom=zoom)
+
+            results.append(
+                {
+                    "file_name": file_name,
+                    "page_number": page_number,
+                    "engine": engine,
+                    "score": score,
+                    "raw_text": raw_text,
+                    "processed_image": processed,
+                    "tables": tables,
+                    "layout": layout,
+                    "report": format_review_report(raw_text, score, engine),
+                }
+            )
+    finally:
+        doc.close()
+
+    return results
+
+
+def preprocess_image(image_bgr: np.ndarray) -> np.ndarray:
+    if image_bgr is None:
+        raise ValueError("Empty image.")
+    img = crop_document(image_bgr)
+    img = deskew(img)
+    img = upscale_document(img, factor=4)
+    enhanced = enhance_document(img)
+    if len(enhanced.shape) == 2:
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    return enhanced
+
+
+def ocr_worker(files_payload: List[Dict[str, Any]], params: Dict[str, Any], task_state: Dict[str, Any]) -> None:
+    try:
+        all_blocks: List[str] = []
+        failed_files: List[Tuple[str, str]] = []
+        pages_out: List[Dict[str, Any]] = []
+        layout_pages: List[Dict[str, Any]] = []
+
+        total_tasks = len(files_payload)
+        task_state["total_files"] = total_tasks
+        task_state["progress"] = 0.0
+        task_state["status"] = "Starting OCR..."
+        task_state["done"] = False
+        task_state["error"] = None
+        task_state["result"] = None
+
+        for idx, item in enumerate(files_payload, start=1):
+            name = item["name"]
+            data = item["bytes"]
+            ext = Path(name).suffix.lower()
+
+            task_state["file_index"] = idx
+            task_state["current_file"] = name
+            task_state["status"] = f"Processing file {idx}/{total_tasks}: {name}"
+
+            if ext == ".pdf":
+                page_results = process_pdf_file(
+                    pdf_bytes=data,
+                    file_name=name,
+                    lang=params["lang"],
+                    extract_tables=params["extract_tables"],
+                    page_mode=params["page_mode"],
+                    start_page=params["start_page"],
+                    end_page=params["end_page"],
+                    prefer_text_layer=params["prefer_text_layer"],
+                    zoom=5.0,
+                    task_state=task_state,
+                )
+            else:
+                page_results = [
+                    process_image_page(
+                        image_bytes=data,
+                        file_name=name,
+                        page_number=1,
+                        lang=params["lang"],
+                        extract_tables=params["extract_tables"],
+                        task_state=task_state,
+                    )
+                ]
+
+            for page in page_results:
+                raw_text = page["raw_text"]
+
+                if params["preserve_exact"]:
+                    final_text = raw_text.strip()
+                    if params["normalize_ws"]:
+                        final_text = normalize_text(final_text)
+                else:
+                    final_text = maybe_correct_text(raw_text, params["apply_language_correction"])
+                    if not params["normalize_ws"]:
+                        final_text = final_text.strip()
+
+                page["final_text"] = final_text
+                block = build_page_block(
+                    file_name=page["file_name"],
+                    page_number=page["page_number"],
+                    engine=page["engine"],
+                    score=page["score"],
+                    text=final_text,
+                    tables=page["tables"],
+                )
+                all_blocks.append(block)
+                pages_out.append(page)
+                layout_pages.append(page["layout"])
+
+            task_state["progress"] = idx / total_tasks
+            task_state["status"] = f"Completed file {idx}/{total_tasks}: {name}"
+
+        final_report = "\n\n".join(all_blocks).strip()
+        task_state["result"] = {
+            "final_report": final_report,
+            "pages_out": pages_out,
+            "layout_pages": layout_pages,
+            "failed_files": failed_files,
+        }
+        task_state["done"] = True
+
+    except Exception as exc:
+        task_state["error"] = str(exc)
+        task_state["done"] = True
+
 
 st.set_page_config(page_title="Hard Scan OCR Extractor", layout="wide")
 st.title("Hard Scan OCR Extractor")
-st.caption("Russian/English OCR with page range support, page numbering, and layout-preserving HTML export.")
+st.caption("GPU-enabled OCR with page range support, layout export, and low-memory live timer.")
 
 with st.sidebar:
     st.header("Settings")
@@ -710,9 +385,21 @@ with st.sidebar:
     generate_layout_html = st.checkbox("Generate layout-preserving HTML", value=True)
     show_preview = st.checkbox("Show processed preview", value=True)
     show_diagnostics = st.checkbox("Show diagnostics", value=True)
+
+    st.markdown("---")
+    st.subheader("GPU Status")
+    if SHOW_GPU_STATUS:
+        if gpu_available():
+            st.success("CUDA Enabled")
+            st.write(f"GPU: {gpu_name()}")
+            st.write(f"VRAM: {gpu_memory_total_gb()} GB")
+            st.write(f"Allocated: {gpu_memory_allocated_gb()} GB")
+        else:
+            st.warning("Running on CPU")
+
     st.markdown("---")
     st.write("For exact transcription, keep correction off.")
-    st.write("Layout HTML is the closest to the original page structure.")
+    st.write("Timer updates while OCR is running.")
 
 uploaded_files = st.file_uploader(
     "Upload one or more images or PDFs",
@@ -730,74 +417,196 @@ if run:
     if page_mode == "Page range" and start_page > end_page:
         st.warning("Start page is greater than end page. The values will be swapped automatically.")
 
-    all_blocks: List[str] = []
-    failed_files: List[Tuple[str, str]] = []
-    pages_out: List[Dict[str, Any]] = []
-    layout_pages: List[Dict[str, Any]] = []
+    files_payload = [{"name": f.name, "bytes": f.getvalue()} for f in uploaded_files]
+    params = {
+        "lang": lang,
+        "page_mode": page_mode,
+        "start_page": int(start_page),
+        "end_page": int(end_page),
+        "extract_tables": extract_tables,
+        "prefer_text_layer": prefer_text_layer,
+        "preserve_exact": preserve_exact,
+        "apply_language_correction": apply_language_correction,
+        "normalize_ws": normalize_ws,
+    }
 
-    progress = st.progress(0)
-    total_tasks = len(uploaded_files)
+    task_state: Dict[str, Any] = {
+        "done": False,
+        "error": None,
+        "result": None,
+        "progress": 0.0,
+        "status": "Starting OCR...",
+        "current_file": "",
+        "current_page": 0,
+        "page_total": 0,
+        "total_files": len(files_payload),
+        "file_index": 0,
+        "start_time": time.perf_counter(),
+    }
 
-    for idx, file in enumerate(uploaded_files, start=1):
-        try:
-            name = file.name
-            ext = Path(name).suffix.lower()
-            data = file.getvalue()
+    worker = threading.Thread(
+        target=ocr_worker,
+        args=(files_payload, params, task_state),
+        daemon=True,
+    )
+    worker.start()
 
-            if ext == ".pdf":
-                page_results = process_pdf_file(
-                    pdf_bytes=data,
-                    file_name=name,
-                    lang=lang,
-                    extract_tables=extract_tables,
-                    page_mode=page_mode,
-                    start_page=int(start_page),
-                    end_page=int(end_page),
-                    prefer_text_layer=prefer_text_layer,
-                    zoom=5.0,
-                )
-            else:
-                page_results = [
-                    process_image_page(
-                        image_bytes=data,
-                        file_name=name,
-                        page_number=1,
-                        lang=lang,
-                        extract_tables=extract_tables,
-                    )
-                ]
+    status_placeholder = st.empty()
+    timer_col, device_col = st.columns(2)
+    timer_placeholder = timer_col.empty()
+    device_placeholder = device_col.empty()
+    progress_placeholder = st.progress(0)
+    details_placeholder = st.empty()
 
-            for page in page_results:
-                raw_text = page["raw_text"]
+    while not task_state["done"]:
 
-                if preserve_exact:
-                    final_text = raw_text.strip()
-                    if normalize_ws:
-                        final_text = normalize_text(final_text)
-                else:
-                    final_text = maybe_correct_text(raw_text, apply_language_correction)
-                    if not normalize_ws:
-                        final_text = final_text.strip()
+        elapsed = time.perf_counter() - task_state["start_time"]
 
-                page["final_text"] = final_text
-                block = build_page_block(
-                    file_name=page["file_name"],
-                    page_number=page["page_number"],
-                    engine=page["engine"],
-                    score=page["score"],
-                    text=final_text,
-                    tables=page["tables"],
-                )
-                all_blocks.append(block)
-                pages_out.append(page)
-                layout_pages.append(page["layout"])
+        status_placeholder.info(
+            task_state.get("status", "OCR processing...")
+        )
 
-        except Exception as exc:
-            failed_files.append((file.name, str(exc)))
+        if SHOW_PROCESSING_TIMER:
+            timer_placeholder.metric(
+                "⏱ Processing Time",
+                format_hms(elapsed)
+            )
 
-        progress.progress(idx / total_tasks)
+        # =====================================
+        # DEVICE STATUS
+        # =====================================
 
-    final_report = "\n\n".join(all_blocks).strip()
+        device_info = get_actual_device()
+
+        current_engine = task_state.get(
+            "engine",
+            "Unknown"
+        )
+
+        if device_info["device"] == "GPU":
+
+            device_placeholder.success(
+                f"""
+    🚀 GPU ACTIVE
+
+    Engine:
+    {current_engine}
+
+    GPU:
+    {device_info['name']}
+
+    VRAM:
+    {device_info['memory']} GB
+    """
+            )
+
+        else:
+
+            device_placeholder.warning(
+                f"""
+    🖥 CPU ACTIVE
+
+    Engine:
+    {current_engine}
+    """
+            )
+
+        progress_value = float(
+            task_state.get("progress", 0.0)
+        )
+
+        progress_value = max(
+            0.0,
+            min(1.0, progress_value)
+        )
+
+        progress_placeholder.progress(
+            progress_value
+        )
+
+        current_file = task_state.get(
+            "current_file",
+            ""
+        )
+
+        current_page = int(
+            task_state.get(
+                "current_page",
+                0
+            )
+        )
+
+        page_total = int(
+            task_state.get(
+                "page_total",
+                0
+            )
+        )
+
+        time.sleep(0.5)
+
+    elapsed = time.perf_counter() - task_state["start_time"]
+    elapsed_text = format_hms(elapsed)
+
+    if SHOW_PROCESSING_TIMER:
+        timer_placeholder.metric("⏱ Processing Time", elapsed_text)
+    progress_placeholder.progress(1.0)
+
+    if task_state.get("error"):
+        status_placeholder.error(f"OCR failed: {task_state['error']}")
+        st.stop()
+
+    result = task_state.get("result") or {}
+    final_report = result.get("final_report", "")
+    pages_out = result.get("pages_out", [])
+    layout_pages = result.get("layout_pages", [])
+    failed_files = result.get("failed_files", [])
+
+    status_placeholder.success(f"OCR completed in {elapsed_text}")
+
+    device_info = get_actual_device()
+
+    last_engine = task_state.get(
+        "engine",
+        "Unknown"
+    )
+
+    if device_info["device"] == "GPU":
+
+        device_placeholder.success(
+            f"""
+    ✅ OCR COMPLETED
+
+    Device:
+    GPU
+
+    Engine:
+    {last_engine}
+
+    GPU:
+    {device_info['name']}
+
+    VRAM Used:
+    {device_info['memory']} GB
+    """
+        )
+
+    else:
+
+        device_placeholder.warning(
+            f"""
+    ✅ OCR COMPLETED
+
+    Device:
+    CPU
+
+    Engine:
+    {last_engine}
+    """
+        )
+
+    st.subheader("Processing time")
+    st.info(f"⏱ Total processing time: {elapsed_text}")
 
     st.subheader("Extracted text")
     st.text_area("OCR output", final_report, height=420)
@@ -870,5 +679,5 @@ if run:
 
 st.markdown("---")
 st.markdown(
-    "Trying best for ocr with its structure"
+    "Trying best..."
 )

@@ -1,15 +1,19 @@
 import base64
 from functools import lru_cache
+from io import StringIO
 from typing import Any, Dict, List, Tuple
 
 import cv2
 import fitz
 import numpy as np
+import pandas as pd
+from .table_structure import extract_borderless_tables
 
 try:
-    from paddleocr import PaddleOCR
+    from paddleocr import PaddleOCR, PPStructure
 except Exception:
     PaddleOCR = None
+    PPStructure = None
 
 
 @lru_cache(maxsize=1)
@@ -18,6 +22,16 @@ def get_box_ocr():
         return None
     try:
         return PaddleOCR(use_angle_cls=True, lang="ru", show_log=False)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def get_table_engine():
+    if PPStructure is None:
+        return None
+    try:
+        return PPStructure(show_log=False)
     except Exception:
         return None
 
@@ -76,6 +90,32 @@ def text_from_native_block(block: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def extract_native_text_blocks(page: fitz.Page, zoom: float) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return items
+
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        text = text_from_native_block(block)
+        bbox = block.get("bbox")
+        if not text or not bbox:
+            continue
+        items.append(
+            {
+                "kind": "text",
+                "bbox_px": bbox_to_px(tuple(bbox), zoom),
+                "text": text,
+                "conf": 1.0,
+                "source": "native",
+            }
+        )
+    return items
+
+
 def extract_text_boxes_with_paddle(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
     engine = get_box_ocr()
     if engine is None:
@@ -98,22 +138,20 @@ def extract_text_boxes_with_paddle(image_bgr: np.ndarray) -> List[Dict[str, Any]
                 box = det[0]
                 text = det[1][0]
                 conf = float(det[1][1])
-
                 xs = [p[0] for p in box]
                 ys = [p[1] for p in box]
                 bbox_px = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-
                 items.append(
                     {
                         "kind": "text",
                         "bbox_px": bbox_px,
                         "text": text,
                         "conf": conf,
+                        "source": "paddleocr",
                     }
                 )
             except Exception:
                 continue
-
     return items
 
 
@@ -127,14 +165,11 @@ def extract_image_blocks_from_native(page: fitz.Page, page_bgr: np.ndarray, zoom
     for block in data.get("blocks", []):
         if block.get("type") != 1:
             continue
-
         bbox = block.get("bbox")
         if not bbox:
             continue
-
         bbox_px = bbox_to_px(tuple(bbox), zoom)
         crop = crop_bgr(page_bgr, bbox_px)
-
         items.append(
             {
                 "kind": "image",
@@ -142,86 +177,92 @@ def extract_image_blocks_from_native(page: fitz.Page, page_bgr: np.ndarray, zoom
                 "image_b64": image_to_b64(crop),
             }
         )
-
     return items
 
 
-def extract_native_text_blocks(page: fitz.Page, zoom: float) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    try:
-        data = page.get_text("dict")
-    except Exception:
-        return items
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
 
-    for block in data.get("blocks", []):
-        if block.get("type") != 0:
-            continue
+    def esc(v: Any) -> str:
+        if pd.isna(v):
+            return ""
+        s = str(v)
+        return s.replace("\n", " ").replace("|", "\\|").strip()
 
-        text = text_from_native_block(block)
-        if not text:
-            continue
+    headers = [esc(c) for c in df.columns]
+    rows = [[esc(v) for v in row] for row in df.fillna("").values.tolist()]
+    header_line = "| " + " | ".join(headers) + " |"
+    sep_line = "| " + " | ".join(["---"] * len(headers)) + " |"
+    data_lines = ["| " + " | ".join(row) + " |" for row in rows]
+    return "\n".join([header_line, sep_line] + data_lines)
 
-        bbox = block.get("bbox")
-        if not bbox:
-            continue
 
-        items.append(
-            {
-                "kind": "text",
-                "bbox_px": bbox_to_px(tuple(bbox), zoom),
-                "text": text,
-                "conf": 1.0,
-                "source": "native",
-            }
-        )
-
-    return items
+def crop_and_prepare_for_table(image_bgr: np.ndarray) -> np.ndarray:
+    from preprocessing import crop_document, deskew, upscale_document
+    img = crop_document(image_bgr)
+    img = deskew(img)
+    img = upscale_document(img, factor=2)
+    return img
 
 
 def extract_tables_from_page(page: fitz.Page, page_bgr: np.ndarray, zoom: float) -> List[Dict[str, Any]]:
     tables: List[Dict[str, Any]] = []
 
-    if not hasattr(page, "find_tables"):
-        return tables
-
-    try:
-        finder = page.find_tables()
-    except Exception:
-        return tables
-
-    found = getattr(finder, "tables", finder)
-    if not found:
-        return tables
-
-    for idx, table in enumerate(found, start=1):
+    # First try the PDF-native table detector if available.
+    if hasattr(page, "find_tables"):
         try:
-            bbox = getattr(table, "bbox", None)
-            if bbox is None and isinstance(table, dict):
-                bbox = table.get("bbox")
-            if bbox is None:
-                continue
+            finder = page.find_tables()
+            found = getattr(finder, "tables", finder)
+            if found:
+                for idx, table in enumerate(found, start=1):
+                    try:
+                        bbox = getattr(table, "bbox", None)
+                        if bbox is None and isinstance(table, dict):
+                            bbox = table.get("bbox")
+                        if bbox is None:
+                            continue
 
-            bbox_px = bbox_to_px(tuple(bbox), zoom)
-            crop = crop_bgr(page_bgr, bbox_px)
+                        bbox_px = bbox_to_px(tuple(bbox), zoom)
+                        crop = crop_bgr(page_bgr, bbox_px)
+                        rows = []
+                        if hasattr(table, "extract"):
+                            try:
+                                rows = table.extract()
+                            except Exception:
+                                rows = []
 
-            rows = []
-            if hasattr(table, "extract"):
-                try:
-                    rows = table.extract()
-                except Exception:
-                    rows = []
+                        df = None
+                        if rows:
+                            try:
+                                df = pd.DataFrame(rows)
+                            except Exception:
+                                df = None
 
-            tables.append(
-                {
-                    "kind": "table",
-                    "table_index": idx,
-                    "bbox_px": bbox_px,
-                    "image_b64": image_to_b64(crop),
-                    "rows": rows,
-                }
-            )
+                        tables.append(
+                            {
+                                "kind": "table",
+                                "table_index": idx,
+                                "bbox_px": bbox_px,
+                                "image_b64": image_to_b64(crop),
+                                "rows": rows,
+                                "df": df,
+                                "markdown": dataframe_to_markdown(df) if df is not None else "",
+                            }
+                        )
+                    except Exception:
+                        continue
         except Exception:
-            continue
+            pass
+
+    if tables:
+        return tables
+
+    # Borderless-table fallback from OCR word positions.
+    try:
+        tables = extract_borderless_tables(page_bgr)
+    except Exception:
+        tables = []
 
     return tables
 
@@ -234,12 +275,7 @@ def extract_page_layout(page: fitz.Page, zoom: float = 5.0) -> Dict[str, Any]:
     images = extract_image_blocks_from_native(page, page_bgr, zoom=zoom)
     tables = extract_tables_from_page(page, page_bgr, zoom=zoom)
 
-    # If the PDF has no usable text layer, use OCR boxes.
-    if native_text:
-        text_items = native_text
-    else:
-        text_items = extract_text_boxes_with_paddle(page_bgr)
-
+    text_items = native_text if native_text else extract_text_boxes_with_paddle(page_bgr)
     elements = text_items + images + tables
     elements.sort(key=lambda item: (item["bbox_px"][1], item["bbox_px"][0]))
 
@@ -256,15 +292,91 @@ def extract_page_layout(page: fitz.Page, zoom: float = 5.0) -> Dict[str, Any]:
 
 def extract_layout_from_image(image_bgr: np.ndarray) -> Dict[str, Any]:
     height_px, width_px = image_bgr.shape[:2]
-
     text_items = extract_text_boxes_with_paddle(image_bgr)
-
+    tables = []
     return {
         "page_width_px": width_px,
         "page_height_px": height_px,
         "page_b64": image_to_b64(image_bgr),
-        "elements": text_items,
+        "elements": text_items + tables,
         "text_items": text_items,
         "image_items": [],
         "table_items": [],
     }
+
+
+def extract_tables_from_image(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    tables: List[Dict[str, Any]] = []
+
+    try:
+        tables = extract_borderless_tables(image_bgr)
+    except Exception:
+        tables = []
+
+    if tables:
+        return tables
+
+    # Fallback to PPStructure if borderless reconstruction did not find anything.
+    engine = get_table_engine()
+    if engine is None:
+        return tables
+
+    try:
+        table_img = crop_and_prepare_for_table(image_bgr)
+        result = engine(table_img)
+    except Exception:
+        return tables
+
+    if not result:
+        return tables
+
+    for idx, item in enumerate(result, start=1):
+        try:
+            if not isinstance(item, dict) or item.get("type") != "table":
+                continue
+
+            bbox = item.get("bbox")
+            res = item.get("res")
+            html = ""
+
+            if isinstance(res, dict):
+                html = res.get("html", "") or ""
+            elif isinstance(res, str):
+                html = res
+
+            df = None
+            rows = []
+            if html:
+                try:
+                    parsed = pd.read_html(StringIO(html))
+                    if parsed:
+                        df = parsed[0]
+                        rows = df.values.tolist()
+                except Exception:
+                    df = None
+
+            bbox_px = (
+                0,
+                0,
+                image_bgr.shape[1],
+                image_bgr.shape[0],
+            ) if bbox is None else bbox_to_px(tuple(bbox), 1.0)
+
+            crop = crop_bgr(image_bgr, bbox_px)
+
+            tables.append(
+                {
+                    "kind": "table",
+                    "table_index": idx,
+                    "bbox_px": bbox_px,
+                    "image_b64": image_to_b64(crop),
+                    "rows": rows,
+                    "df": df,
+                    "html": html,
+                    "markdown": dataframe_to_markdown(df) if df is not None else "",
+                }
+            )
+        except Exception:
+            continue
+
+    return tables

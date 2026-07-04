@@ -88,7 +88,6 @@ def _correct_core_word(core: str) -> str:
         return "-".join(_correct_core_word(part) for part in parts)
 
     cyr_count, lat_count = _script_counts(core)
-
     candidates: List[str] = [core]
 
     if cyr_count >= lat_count and lat_count > 0:

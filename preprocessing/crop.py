@@ -11,27 +11,21 @@ def crop_document(image):
 
     best_box = None
     best_area = 0
-
     thresholds = [5, 8, 12, 15, 20, 25, 30, 40, 50]
 
     for t in thresholds:
         _, mask = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
-
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < 200:
                 continue
-
             x, y, bw, bh = cv2.boundingRect(cnt)
-
             if bw < 10 or bh < 10:
                 continue
-
             if area > best_area:
                 best_area = area
                 best_box = (x, y, bw, bh)
@@ -51,5 +45,4 @@ def crop_document(image):
     cropped = image[y1:y2, x1:x2]
     if cropped.size == 0:
         return image
-
     return cropped

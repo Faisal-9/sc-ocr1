@@ -4,6 +4,9 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 
+from config import USE_GPU
+from utils.gpu import gpu_available
+
 try:
     from paddleocr import PaddleOCR
 except Exception:
@@ -14,8 +17,14 @@ except Exception:
 def load_paddle_engine():
     if PaddleOCR is None:
         return None
+
     try:
-        return PaddleOCR(use_angle_cls=True, lang="ru", show_log=False)
+        return PaddleOCR(
+            use_angle_cls=True,
+            lang="ru",
+            use_gpu=bool(USE_GPU and gpu_available()),
+            show_log=False,
+        )
     except Exception:
         return None
 

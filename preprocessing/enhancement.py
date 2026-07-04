@@ -1,5 +1,4 @@
 import cv2
-import numpy as np
 
 
 def enhance_document(image):
@@ -12,8 +11,6 @@ def enhance_document(image):
         gray = image.copy()
 
     gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-
     return enhanced

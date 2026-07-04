@@ -36,7 +36,6 @@ def _mean_confidence_from_data(data) -> float:
                 continue
     except Exception:
         return 0.0
-
     return float(np.mean(confs)) if confs else 0.0
 
 

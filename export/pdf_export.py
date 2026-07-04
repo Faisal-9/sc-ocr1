@@ -25,7 +25,6 @@ def _register_unicode_font() -> str:
                 return "CustomFont"
             except Exception:
                 pass
-
     return font_name
 
 
@@ -68,7 +67,6 @@ def export_to_pdf(text: str, title: Optional[str] = "OCR Extracted Text") -> byt
 
     font_name = _register_unicode_font()
     c.setFont(font_name, font_size)
-
     y = top
 
     def draw_line(line: str):
